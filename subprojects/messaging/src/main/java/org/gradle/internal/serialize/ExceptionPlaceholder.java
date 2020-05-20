@@ -16,6 +16,7 @@
 
 package org.gradle.internal.serialize;
 
+import org.gradle.api.JavaVersion;
 import org.gradle.api.Transformer;
 import org.gradle.internal.Cast;
 import org.gradle.internal.UncheckedException;
@@ -34,6 +35,7 @@ import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -76,6 +78,10 @@ class ExceptionPlaceholder implements Serializable {
             message = throwable.getMessage();
         } catch (Throwable failure) {
             getMessageExec = failure;
+        }
+
+        if (isJava14()) {
+            Java14NullPointerExceptionUsefulMessageSupport.maybeReplaceUsefulNullPointerMessage(throwable, message);
         }
 
         try {
@@ -126,6 +132,10 @@ class ExceptionPlaceholder implements Serializable {
             }
             this.causes = placeholders;
         }
+    }
+
+    private static boolean isJava14() {
+        return JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_14);
     }
 
     public Throwable read(Transformer<Class<?>, String> classNameTransformer, Transformer<ExceptionReplacingObjectInputStream, InputStream> objectInputStreamCreator) throws IOException {
@@ -280,5 +290,54 @@ class ExceptionPlaceholder implements Serializable {
             result.add(placeholder.read(classNameTransformer, objectInputStreamCreator));
         }
         return result;
+    }
+
+    /**
+     * A support utility which will replace the message of NullPointerException
+     * thrown in Java 14+ with the "useful" one when it's not using a custom
+     * message.
+     *
+     * We have to do this because Java 14 will not serialize the required context
+     * and therefore when the exception is sent back to the daemon, it loses
+     * information required to create a "useful message".
+     *
+     */
+    private static class Java14NullPointerExceptionUsefulMessageSupport {
+        private final static Field DETAIL_MESSAGE_FIELD;
+
+        static {
+            Field detailField = null;
+            try {
+                detailField = Throwable.class.getDeclaredField("detailMessage");
+                detailField.setAccessible(true);
+            } catch (NoSuchFieldException e) {
+                // do nothing
+            }
+            DETAIL_MESSAGE_FIELD = detailField;
+        }
+
+        private static void maybeReplaceUsefulNullPointerMessage(Throwable throwable, String message) {
+            if (DETAIL_MESSAGE_FIELD != null) {
+                try {
+                    while (throwable != null) {
+                        if (isGenericNullPointerException(throwable)) {
+                            DETAIL_MESSAGE_FIELD.set(throwable, message);
+                        }
+                        Throwable cause = throwable.getCause();
+                        if (cause != throwable) {
+                            throwable = cause;
+                        } else {
+                            throwable = null;
+                        }
+                    }
+                } catch (IllegalAccessException e) {
+                    // do nothing
+                }
+            }
+        }
+
+        private static boolean isGenericNullPointerException(Throwable throwable) throws IllegalAccessException {
+            return throwable instanceof NullPointerException && DETAIL_MESSAGE_FIELD.get(throwable) == null;
+        }
     }
 }
